@@ -1,0 +1,521 @@
+---
+title: "Predictions of lipoproteins levels based on genetic and external data."
+author: "Polina Lisukova"
+output: html_document
+---
+
+```{r}
+# Comment translated to English.
+library(dplyr)
+library(randomForest)
+library(xgboost)
+library(caret)
+library(e1071)
+library(glmnet)
+
+# Comment translated to English.
+data <- read.csv("HDL_students_scores+meta+wei+hei.csv", stringsAsFactors = FALSE)
+
+# Comment translated to English.
+data <- data %>%
+  filter(unit == "mmol/L") %>%
+  mutate(
+    BMI = ifelse(height == 0, 0, weight / (height / 100)^2)
+  ) %>%
+  filter(between(height, 100, 200),
+         between(weight, 40, 160),
+         between(value, 0.05, 3.5),
+         between(BMI, 16, 40)) %>%
+  filter(!is.na(smoking_status) & !is.na(alcoholVolume) & !is.na(alcohol_consumption))
+
+# Comment translated to English.
+cols_to_factor <- c("alcohol_consumption", "alcoholVolume", "smoking_status", "gender.x")
+data[cols_to_factor] <- lapply(data[cols_to_factor], as.factor)
+
+# Comment translated to English.
+data <- data[!duplicated(data[, -1]), ]
+
+# Comment translated to English.
+features <- c("score", "gender.x", "age.x", "alcohol_consumption", 
+              "smoking_status", "alcoholVolume", "weight", "height", "BMI")
+
+# Comment translated to English.
+combinations <- list()
+for (i in 2:length(features)) {
+  combinations <- c(combinations, lapply(combn(features, i, simplify = FALSE), as.vector))
+}
+
+# Comment translated to English.
+evaluate_models <- function(data, combination) {
+  set.seed(42)
+  train_indices <- sample(1:nrow(data), size = 0.8 * nrow(data))
+  train_data <- data[train_indices, ]
+  test_data <- data[-train_indices, ]
+  
+# Comment translated to English.
+  train_matrix <- model.matrix(~ . - 1, data = train_data[, combination])
+  test_matrix <- model.matrix(~ . - 1, data = test_data[, combination])
+  preProc <- preProcess(train_matrix, method = c("center", "scale"))
+  train_scaled <- predict(preProc, train_matrix)
+  test_scaled <- predict(preProc, test_matrix)
+  
+# Comment translated to English.
+  model_lm <- glm(value ~ ., data = train_data[, c("value", combination)])
+  pred_lm <- predict(model_lm, newdata = test_data)
+  
+# Comment translated to English.
+  model_rf <- randomForest(value ~ ., data = train_data[, c("value", combination)],
+                           ntree = 300, mtry = max(floor(length(combination)/3), 1),
+                           nodesize = 5, importance = TRUE)
+  pred_rf <- predict(model_rf, newdata = test_data)
+  
+# Comment translated to English.
+  dtrain <- xgb.DMatrix(data = train_scaled, label = train_data$value)
+  dtest <- xgb.DMatrix(data = test_scaled, label = test_data$value)
+  xgb_model <- xgb.train(params = list(objective = "reg:squarederror", eta = 0.01,
+                                       max_depth = 3, subsample = 0.7, colsample_bytree = 0.7,
+                                       lambda = 2, alpha = 1, verbosity = 0),
+                         data = dtrain, nrounds = 300,
+                         early_stopping_rounds = 20,
+                         watchlist = list(train = dtrain, test = dtest), verbose = 0)
+  pred_xgb <- predict(xgb_model, dtest)
+  
+# Comment translated to English.
+  model_svr <- svm(value ~ ., data = train_data[, c("value", combination)])
+  pred_svr <- predict(model_svr, newdata = test_data)
+  
+# Comment translated to English.
+  model_en <- cv.glmnet(train_scaled, train_data$value, alpha = 0.5)
+  pred_en <- predict(model_en, s = "lambda.min", newx = test_scaled)
+  
+# Comment translated to English.
+  get_metrics <- function(actual, pred) {
+  c(MAE = mean(abs(actual - pred), na.rm = TRUE),
+    MSE = mean((actual - pred)^2, na.rm = TRUE),
+    R2 = cor(actual, pred, use = "complete.obs")^2,
+    MAPE = mean(abs((actual - pred)/actual) * 100, na.rm = TRUE))  # Важно умножить на 100 для %
+}
+  
+  data.frame(
+    Combination = paste(combination, collapse = ", "),
+    Model = c("Linear Regression", "Random Forest", "XGBoost", "SVR", "Elastic Net"),
+    rbind(
+      get_metrics(test_data$value, pred_lm),
+      get_metrics(test_data$value, pred_rf),
+      get_metrics(test_data$value, pred_xgb),
+      get_metrics(test_data$value, pred_svr),
+      get_metrics(test_data$value, pred_en)
+    )
+  )
+}
+
+# Comment translated to English.
+results <- do.call(rbind, lapply(combinations, function(comb) {
+  cat("Processing:", paste(comb, collapse = ", "), "\n")
+  evaluate_models(data, comb)
+}))
+```
+
+
+
+```{r}
+# Comment translated to English.
+top_models <- results %>% arrange(desc(R2)) %>% head(5)
+
+# Comment translated to English.
+cross_validate_model <- function(data, combination, model_type, n_folds = 5) {
+  set.seed(42)
+  folds <- createFolds(data$value, k = n_folds, list = TRUE)
+  metrics_list <- list()
+  
+  for (i in seq_along(folds)) {
+    train_indices <- unlist(folds[-i])
+    test_indices <- folds[[i]]
+    train_data <- data[train_indices, ]
+    test_data <- data[test_indices, ]
+    
+    train_matrix <- model.matrix(~ . - 1, data = train_data[, combination])
+    test_matrix <- model.matrix(~ . - 1, data = test_data[, combination])
+    preProc <- preProcess(train_matrix, method = c("center", "scale"))
+    train_scaled <- predict(preProc, train_matrix)
+    test_scaled <- predict(preProc, test_matrix)
+    
+    if (model_type == "Linear Regression") {
+      model <- glm(value ~ ., data = train_data[, c("value", combination)])
+      pred <- predict(model, newdata = test_data)
+    } else if (model_type == "Random Forest") {
+      model <- randomForest(value ~ ., data = train_data[, c("value", combination)],
+                            ntree = 300, mtry = max(floor(length(combination)/3), 1),
+                            nodesize = 5)
+      pred <- predict(model, newdata = test_data)
+    } else if (model_type == "XGBoost") {
+      dtrain <- xgb.DMatrix(data = train_scaled, label = train_data$value)
+      dtest <- xgb.DMatrix(data = test_scaled, label = test_data$value)
+      model <- xgb.train(params = list(objective = "reg:squarederror", eta = 0.01,
+                                       max_depth = 3, subsample = 0.7, colsample_bytree = 0.7,
+                                       lambda = 2, alpha = 1, verbosity = 0),
+                         data = dtrain, nrounds = 300, verbose = 0)
+      pred <- predict(model, dtest)
+    } else if (model_type == "SVR") {
+      model <- svm(value ~ ., data = train_data[, c("value", combination)])
+      pred <- predict(model, newdata = test_data)
+    } else if (model_type == "Elastic Net") {
+      model <- cv.glmnet(train_scaled, train_data$value, alpha = 0.5)
+      pred <- predict(model, s = "lambda.min", newx = test_scaled)
+    }
+    
+    metrics <- c(MAE = mean(abs(test_data$value - pred), na.rm = TRUE),
+             MSE = mean((test_data$value - pred)^2, na.rm = TRUE),
+             R2 = cor(test_data$value, pred, use = "complete.obs")^2,
+             MAPE = mean(abs((test_data$value - pred) / test_data$value) * 100, na.rm = TRUE))
+    metrics_list[[i]] <- metrics
+  }
+  
+  colMeans(do.call(rbind, metrics_list))
+}
+
+# Comment translated to English.
+cv_results <- do.call(rbind, lapply(1:nrow(top_models), function(i) {
+  row <- top_models[i, ]
+  combination <- unlist(strsplit(row$Combination, ", "))
+  model_type <- row$Model
+  metrics <- cross_validate_model(data, combination, model_type)
+  c(Combination = row$Combination, Model = model_type, metrics)
+}))
+
+print(cv_results)
+```
+
+
+
+```{r}
+
+cv_results <- as.data.frame(cv_results)
+
+# Comment translated to English.
+best_features <- unlist(strsplit(cv_results$Combination[which.max(cv_results$R2)], ", "))
+
+set.seed(42)
+
+# Comment translated to English.
+train_indices <- sample(1:nrow(data), size = 0.8 * nrow(data))
+
+# Comment translated to English.
+train_data <- data[train_indices, c("value", best_features)]
+test_data <- data[-train_indices, c("value", best_features)]
+
+# Comment translated to English.
+model_rf_best <- randomForest(value ~ ., data = train_data,
+                              ntree = 300,
+                              mtry = max(floor(length(best_features)/3), 1),
+                              nodesize = 5,
+                              importance = TRUE)
+
+# Comment translated to English.
+pred_rf_best <- predict(model_rf_best, newdata = test_data[, best_features])
+```
+
+
+
+```{r}
+# Comment translated to English.
+par(pty = "s")
+
+# Comment translated to English.
+plot(test_data$value, pred_rf_best,
+     xlim = range(c(test_data$value, pred_rf_best)),
+     ylim = range(c(test_data$value, pred_rf_best)),
+     xlab = "Actual values", 
+     ylab = "Predicted values", 
+     main = "Actual vs Predicted Values",
+     pch = 19, col = "skyblue", )  
+# Comment translated to English.
+abline(a = 0, b = 1, col = "red")  
+grid()
+```
+
+
+
+```{r}
+# Comment translated to English.
+residuals <- test_data$value - pred_rf_best
+
+# Comment translated to English.
+par(mfrow = c(1,1), pty = "m", mar = c(4,4,3,2))
+
+# Comment translated to English.
+plot(pred_rf_best, residuals,
+     xlab = "Predicted values", 
+     ylab = "Remainder (Fact - Forecast)",
+     main = "Analysis of the regression model residuals",
+     pch = 19, col = adjustcolor("steelblue", alpha.f = 0.6),
+     cex = 1.2, las = 1,
+     ylim = c(-max(abs(residuals))*1.1, max(abs(residuals))*1.1))
+
+# Comment translated to English.
+abline(h = 0, col = "red3", lwd = 2)  # Горизонтальная линия нуля
+grid(col = "lightgray", lty = "dotted")  # Сетка для удобства чтения
+
+# Comment translated to English.
+lines(lowess(pred_rf_best, residuals), col = "darkgreen", lwd = 2)
+
+# Comment translated to English.
+legend("topright", 
+       legend = c("Remainder", "The zero line", "The trend of leftovers"),
+       col = c("steelblue", "red3", "darkgreen"),
+       pch = c(19, NA, NA), lty = c(NA, 1, 1), lwd = 2)
+```
+
+
+
+```{r}
+print(importance(model_rf_best))
+
+
+varImpPlot(model_rf_best, 
+           main = "The importance of signs", 
+           type = 1)  # type = 1 для Mean Decrease Accuracy
+```
+
+
+
+```{r}
+# Comment translated to English.
+age_breaks <- c(20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70)
+
+# Comment translated to English.
+age_labels <- paste(head(age_breaks, -1), tail(age_breaks, -1), sep = "-")
+
+# Comment translated to English.
+data$age_group <- cut(data$age.x, 
+                      breaks = age_breaks, 
+                      labels = age_labels, 
+                      right = FALSE, 
+                      include.lowest = TRUE)
+
+# Comment translated to English.
+data <- data[!is.na(data$age_group), ]
+
+plot <- ggplot(data, aes(x = age_group, y = value, fill = gender.x)) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 1.15, ymax = 4.65,
+           fill = "lightgreen", alpha = 0.3) +
+  geom_boxplot() +
+  labs(title = "The influence of age on HDL levels by age groups",
+       x = "Age groups",
+       y = "HDL",
+       fill = "Sex") +
+  theme_minimal() +
+  scale_fill_manual(values = c("lightpink", "lightblue")) +
+  theme(panel.grid.major = element_line(color = "gray80"),
+        panel.grid.minor = element_line(color = "gray90"),
+        axis.text.x = element_text(angle = 45, hjust = 1)) +
+  coord_cartesian(ylim = c(0, 3))  # Ограничение оси y от 0 до 3
+
+print(plot)
+```
+
+
+```{r}
+# Comment translated to English.
+
+ggplot(data, aes(x = score, y = value)) +  
+  geom_point(shape = 21,                     
+             color = "blue",                 
+             fill = "skyblue",               
+             size = 3) +                     
+  geom_smooth(method = "lm", color = "red") + 
+  labs(title = "HDL Dependence on PRS", 
+       x = "Score",                          
+       y = "HDL")    
+```
+```{r}
+str(test_data$age_group)
+str(test_data$gender.x)
+length(test_data$age_group)
+length(test_data$gender.x)
+```
+
+
+
+```{r}
+test_full <- data[-train_indices, ]
+
+# Comment translated to English.
+age_breaks <- c(20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70)
+age_labels <- paste(head(age_breaks, -1), tail(age_breaks, -1), sep = "-")
+
+# Comment translated to English.
+test_full$age_group <- cut(test_full$age.x,
+                           breaks = age_breaks,
+                           labels = age_labels,
+                           right = FALSE,
+                           include.lowest = TRUE)
+
+# Comment translated to English.
+valid_rows <- !is.na(test_full$age_group)
+
+# Comment translated to English.
+data_test_rf_pred <- data.frame(
+  HDL = c(test_full$value[valid_rows], pred_rf_best[valid_rows]),
+  age_group = rep(test_full$age_group[valid_rows], 2),
+  gender.x = rep(test_full$gender.x[valid_rows], 2),
+  value_type = rep(c("Actual", "Predicted"), each = sum(valid_rows))
+)
+
+# Comment translated to English.
+data_test_rf_pred$lower_norm <- ifelse(data_test_rf_pred$gender.x == "female", 1.3, 1.1)
+
+# Comment translated to English.
+ggplot(data_test_rf_pred, aes(x = age_group, y = HDL, fill = value_type)) +
+# Comment translated to English.
+  geom_rect(
+    data = data.frame(gender.x = c("female", "male"), ymin = c(1.3, 1.0), ymax = 3),
+    aes(xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax),
+    inherit.aes = FALSE,
+    fill = "lightgreen", alpha = 0.3
+  ) +
+  geom_boxplot(alpha = 0.7, color = "grey30") +
+  labs(
+    title = "Comparison of Actual and Predicted HDL Values by Age and Sex",
+    x = "Age Group",
+    y = "HDL (mmol/L)",
+    fill = "Value Type"
+  ) +
+  scale_fill_manual(values = c("Actual" = "#1f78b4", "Predicted" = "#33a02c")) +
+  facet_wrap(~ gender.x) +
+  theme_minimal() +
+  coord_cartesian(ylim = c(0.5, 3)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+
+
+```{r}
+# Comment translated to English.
+lower_norm <- 1.15
+
+# Comment translated to English.
+prs_breaks <- quantile(data$score, probs = c(0, 0.05, 0.10, seq(0.2, 0.9, 0.1), 0.95, 1.0), na.rm = TRUE)
+prs_labels <- c("0-5%", "5-10%", "10-20%", "20-30%", "30-40%", "40-50%", 
+                "50-60%", "60-70%", "70-80%", "80-90%", "90-95%", "95-100%")
+
+data <- data %>%
+  mutate(
+    PRS_group = cut(score, breaks = prs_breaks, labels = prs_labels, include.lowest = TRUE)
+  ) %>%
+  filter(!is.na(PRS_group))
+
+# Comment translated to English.
+result <- data %>%
+  group_by(PRS_group) %>%
+  summarize(
+    percent_below = mean(value < lower_norm, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# Comment translated to English.
+result_long <- result %>%
+  pivot_longer(
+    cols = percent_below,
+    names_to = "deviation_type",
+    values_to = "percent"
+  ) %>%
+  mutate(
+    deviation_type = recode(deviation_type, "percent_below" = "Below normal")
+  )
+
+# Comment translated to English.
+ggplot(result_long, aes(x = PRS_group, y = percent, fill = deviation_type)) +
+  geom_col(alpha = 0.8, width = 0.7) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", percent)),
+    vjust = -0.5,
+    size = 3.2,
+    color = "black"
+  ) +
+  scale_fill_manual(values = c("Below normal" = "#FF6B6B")) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Percentage of people with HDL Levels deviation 
+    by PRS percentiles",
+    x = "PRS Groups (Percentiles)",
+    y = "Percentage of People (%)",
+    fill = "Deviation Category"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "top",
+    panel.grid.major.x = element_blank()
+  )
+
+```
+
+
+
+```{r}
+
+library(data.table)
+library(ggplot2)
+
+# Comment translated to English.
+data <- as.data.table(data)
+
+# Comment translated to English.
+data[, below_norm := ifelse(
+  (gender.x == "male" & value < 1.0) |
+  (gender.x == "female" & value < 1.3), 1, 0)]
+
+# Comment translated to English.
+prs_probs <- c(0, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50,
+               0.60, 0.70, 0.80, 0.90, 0.95, 1.0)
+prs_labels <- c("0–5%", "5–10%", "10–20%", "20–30%", "30–40%", "40–50%",
+                "50–60%", "60–70%", "70–80%", "80–90%", "90–95%", "95–100%")
+
+prs_breaks <- quantile(data$score, probs = prs_probs, na.rm = TRUE)
+
+# Comment translated to English.
+data[, quantile := cut(score, breaks = prs_breaks,
+                       labels = prs_labels, include.lowest = TRUE)]
+data[, quantile := factor(quantile, levels = prs_labels)]
+data[, quantile := relevel(quantile, ref = "0–5%")]  # референсная группа
+
+# Comment translated to English.
+model <- glm(below_norm ~ quantile, data = data, family = binomial())
+
+# Comment translated to English.
+or_results <- as.data.table(exp(cbind(OR = coef(model), confint(model))), keep.rownames = TRUE)
+or_results <- or_results[rn != "(Intercept)"]
+or_results[, rn := gsub("quantile", "", rn)]
+or_results[, rn := factor(rn, levels = setdiff(prs_labels, "0–5%"))]
+
+# Comment translated to English.
+ref_row <- data.table(rn = "0–5%", OR = 1, `2.5 %` = NA_real_, `97.5 %` = NA_real_)
+plot_data <- rbind(or_results, ref_row, fill = TRUE)
+plot_data[, rn := factor(rn, levels = prs_labels)]
+
+# Comment translated to English.
+ggplot(plot_data, aes(x = rn, y = OR)) +
+  geom_point(size = 4, color = "#0073E6") +
+  geom_errorbar(aes(ymin = `2.5 %`, ymax = `97.5 %`),
+                width = 0.3, color = "#0073E6", linewidth = 1.2, na.rm = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "black", linewidth = 0.8) +
+  labs(x = "PRS percentiles", y = "OR (below norm)",
+       title = "Odds Ratio of HDL Deficiency 
+       by PRS Percentile",
+       subtitle = "Reference group: 0–5%") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title.x = element_text(face = "bold", size = 18),
+    axis.title.y = element_text(face = "bold", size = 18),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 14),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 20),
+    plot.subtitle = element_text(hjust = 0.5, size = 16)
+  )
+ggsave("HDL_OR_plot_tall.png", width = 12, height = 12, units = "in", dpi = 300)
+
+```
