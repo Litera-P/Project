@@ -1,0 +1,857 @@
+---
+title: "Serova_For_Report"
+author: "Serova"
+date: "2025-06-18"
+output: html_document
+---
+
+# loading all required libraries
+```{r}
+
+library(tidyr)
+library(ggplot2)
+library(gridExtra)
+library(dplyr)
+library(randomForest)
+library(tidyr)
+library(lattice)
+library(xgboost)  
+library(caret)
+library(Matrix)
+library(dplyr)
+library(glmnet)
+library(e1071)
+library(pROC)
+library(caret)
+
+```
+
+
+
+```{r}
+data <- read.csv("LDL_students_scores+meta+wei+hei.csv", header = TRUE)
+
+# Preprocessing
+data <- data %>%
+  filter(unit == "mmol/L") %>%
+  mutate(
+    BMI = ifelse(height == 0, 0, weight / (height / 100)^2)
+  ) %>%
+  filter(between(height, 100, 200),
+         between(age.x, 18, 70),
+         between(weight, 40, 160),
+         between(value, 0.5, 7),
+         between(BMI, 16, 40)) %>%
+  filter(!is.na(smoking_status) & !is.na(alcoholVolume) & !is.na(alcohol_consumption))
+
+data$smoking_status <- as.character(data$smoking_status)
+data$smoking_status[data$smoking_status == ""] <- NA
+data <- data[!is.na(data$smoking_status), ]
+
+
+# Convert selected columns to factors
+cols_to_factor <- c("alcohol_consumption", "alcoholVolume", "smoking_status", "gender.x")
+data[cols_to_factor] <- lapply(data[cols_to_factor], as.factor)
+
+# Remove duplicates
+data <- data[!duplicated(data[, -1]), ]
+
+# List of features
+features <- c("score", "gender.x", "age.x", "alcohol_consumption", 
+              "smoking_status", "alcoholVolume", "weight", "height", "BMI")
+
+# Generate feature combinations
+combinations <- list()
+for (i in 2:length(features)) {
+  combinations <- c(combinations, lapply(combn(features, i, simplify = FALSE), as.vector))
+}
+
+# Model evaluation function
+evaluate_models <- function(data, combination) {
+  set.seed(42)
+  train_indices <- sample(1:nrow(data), size = 0.8 * nrow(data))
+  train_data <- data[train_indices, ]
+  test_data <- data[-train_indices, ]
+  
+  train_data <- na.omit(train_data)
+  test_data <- na.omit(test_data)
+
+  # Drop unused factor levels in training set
+  train_data <- droplevels(train_data)
+
+  # Synchronize factor levels in test set with train set
+  for (col in combination) {
+    if (is.factor(train_data[[col]])) {
+      test_data[[col]] <- factor(test_data[[col]], levels = levels(train_data[[col]]))
+    }
+  }
+
+  # Prepare model matrices
+  train_matrix <- model.matrix(~ . - 1, data = train_data[, combination])
+  test_matrix <- model.matrix(~ . - 1, data = test_data[, combination])
+  preProc <- preProcess(train_matrix, method = c("center", "scale"))
+  train_scaled <- predict(preProc, train_matrix)
+  test_scaled <- predict(preProc, test_matrix)
+  
+  # Linear regression
+  model_lm <- glm(value ~ ., data = train_data[, c("value", combination)])
+  pred_lm <- predict(model_lm, newdata = test_data)
+  
+  # Random Forest
+  model_rf <- randomForest(value ~ ., data = train_data[, c("value", combination)],
+                           ntree = 300, mtry = max(floor(length(combination)/3), 1),
+                           nodesize = 5, importance = TRUE)
+  pred_rf <- predict(model_rf, newdata = test_data)
+  
+  if (nrow(train_scaled) != length(train_data$value) || nrow(test_scaled) != length(test_data$value)) {
+  warning("Dimensions do not match, skipping combination: ", paste(combination, collapse = ", "))
+  return(NULL)
+}
+  
+  
+  # XGBoost
+  dtrain <- xgb.DMatrix(data = train_scaled, label = train_data$value)
+  dtest <- xgb.DMatrix(data = test_scaled, label = test_data$value)
+  xgb_model <- xgb.train(params = list(objective = "reg:squarederror", eta = 0.01,
+                                       max_depth = 3, subsample = 0.7, colsample_bytree = 0.7,
+                                       lambda = 2, alpha = 1, verbosity = 0),
+                         data = dtrain, nrounds = 300,
+                         early_stopping_rounds = 20,
+                         watchlist = list(train = dtrain, test = dtest), verbose = 0)
+  pred_xgb <- predict(xgb_model, dtest)
+  
+  # SVR
+  model_svr <- svm(value ~ ., data = train_data[, c("value", combination)])
+  pred_svr <- predict(model_svr, newdata = test_data)
+  
+  # Elastic Net
+  model_en <- cv.glmnet(train_scaled, train_data$value, alpha = 0.5)
+  pred_en <- predict(model_en, s = "lambda.min", newx = test_scaled)
+  
+  # Evaluation metrics
+  get_metrics <- function(actual, pred) {
+    c(MAE = mean(abs(actual - pred), na.rm = TRUE),
+      MSE = mean((actual - pred)^2, na.rm = TRUE),
+      R2 = cor(actual, pred, use = "complete.obs")^2)
+  }
+  
+  data.frame(
+    Combination = paste(combination, collapse = ", "),
+    Model = c("Linear Regression", "Random Forest", "XGBoost", "SVR", "Elastic Net"),
+    rbind(
+      get_metrics(test_data$value, pred_lm),
+      get_metrics(test_data$value, pred_rf),
+      get_metrics(test_data$value, pred_xgb),
+      get_metrics(test_data$value, pred_svr),
+      get_metrics(test_data$value, pred_en)
+    )
+  )
+}
+
+# Get evaluation results
+results <- do.call(rbind, lapply(combinations, function(comb) {
+  cat("Processing:", paste(comb, collapse = ", "), "\n")
+  evaluate_models(data, comb)
+}))
+
+```
+
+
+# Histogram of age
+```{r}
+hist(data_no_dup_filt_age$age.x,   
+     main = "Age",     
+     xlab = "Years",               
+     ylab = "Frequency",                 
+     breaks = 20)  
+grid()
+```
+
+# Histogram of height
+```{r}
+hist(data_no_dup_filt_age$height,   
+     main = "Height",     
+     xlab = "cm",               
+     ylab = "Frequency",                 
+     breaks = 30)  
+grid()
+```
+
+
+# Histogram of weight
+```{r}
+hist(data_no_dup_filt_age_weight$weight,   
+     main = "Weight",     
+     xlab = "kg",               
+     ylab = "Frequency",                 
+     breaks = 30)  
+grid()
+```
+
+# Histogram of BMI
+```{r}
+hist(data_no_dup_filt_age_weight_bmi$BMI,   
+     main = "BMI",     
+     xlab = "",               
+     ylab = "Frequency",                 
+     breaks = 20)  
+grid()
+```
+
+# Histogram of LDL value
+```{r}
+hist(data_no_dup_filt_value$value,   
+     main = "LDL value",     
+     xlab = "value, mmol/L",               
+     ylab = "Frequency",                 
+     breaks = 30)  
+grid()
+```
+
+# Histogram of PRS
+```{r}
+hist(data_no_dup_filt_value$score,   
+     main = "Polygenic Risk Score",     
+     xlab = "PRS",               
+     ylab = "Frequency",                 
+     breaks = 30)  
+grid()
+```
+
+
+
+#Cross-validation of top-5 models
+
+```{r}
+top_models <- results %>% arrange(desc(R2)) %>% head(5)
+
+
+cross_validate_model <- function(data, combination, model_type, n_folds = 5) {
+  set.seed(42)
+  
+  data <- data[!is.na(data$value), ]
+
+  
+  folds <- createFolds(data$value, k = n_folds, list = TRUE)
+  metrics_list <- list()
+  
+  for (i in seq_along(folds)) {
+    train_indices <- unlist(folds[-i])
+    test_indices <- folds[[i]]
+    train_data <- data[train_indices, ]
+    test_data <- data[test_indices, ]
+    
+    train_matrix <- model.matrix(~ . - 1, data = train_data[, combination])
+    test_matrix <- model.matrix(~ . - 1, data = test_data[, combination])
+    preProc <- preProcess(train_matrix, method = c("center", "scale"))
+    train_scaled <- predict(preProc, train_matrix)
+    test_scaled <- predict(preProc, test_matrix)
+    
+    if (model_type == "Linear Regression") {
+      model <- glm(value ~ ., data = train_data[, c("value", combination)])
+      pred <- predict(model, newdata = test_data)
+    } else if (model_type == "Random Forest") {
+      model <- randomForest(value ~ ., data = train_data[, c("value", combination)],
+                            ntree = 300, mtry = max(floor(length(combination)/3), 1),
+                            nodesize = 5)
+      pred <- predict(model, newdata = test_data)
+    } else if (model_type == "XGBoost") {
+      dtrain <- xgb.DMatrix(data = train_scaled, label = train_data$value)
+      dtest <- xgb.DMatrix(data = test_scaled, label = test_data$value)
+      model <- xgb.train(params = list(objective = "reg:squarederror", eta = 0.01,
+                                       max_depth = 3, subsample = 0.7, colsample_bytree = 0.7,
+                                       lambda = 2, alpha = 1, verbosity = 0),
+                         data = dtrain, nrounds = 300, verbose = 0)
+      pred <- predict(model, dtest)
+    } else if (model_type == "SVR") {
+      model <- svm(value ~ ., data = train_data[, c("value", combination)])
+      pred <- predict(model, newdata = test_data)
+    } else if (model_type == "Elastic Net") {
+      model <- cv.glmnet(train_scaled, train_data$value, alpha = 0.5)
+      pred <- predict(model, s = "lambda.min", newx = test_scaled)
+    }
+    
+    metrics <- c(MAE = mean(abs(test_data$value - pred), na.rm = TRUE),
+                 MSE = mean((test_data$value - pred)^2, na.rm = TRUE),
+                 R2 = cor(test_data$value, pred, use = "complete.obs")^2)
+    metrics_list[[i]] <- metrics
+  }
+  
+  colMeans(do.call(rbind, metrics_list))
+}
+
+
+cv_results <- do.call(rbind, lapply(1:nrow(top_models), function(i) {
+  row <- top_models[i, ]
+  combination <- unlist(strsplit(row$Combination, ", "))
+  model_type <- row$Model
+  metrics <- cross_validate_model(data, combination, model_type)
+  c(Combination = row$Combination, Model = model_type, metrics)
+}))
+
+print(cv_results)
+```
+
+
+#Building a Random Forest model with the best combination of predictors.
+```{r}
+
+set.seed(42)
+train_indices_noalco <- sample(1:nrow(df_clean_noalco), size = 0.8 * nrow(df_clean_noalco))  
+train_data_rf_noalco <- df_clean_noalco[train_indices_noalco, ]  
+test_data_rf_noalco <- df_clean_noalco[-train_indices_noalco, ]
+
+train_data_rf_noalco <- na.omit(train_data_rf_noalco)
+test_data_rf_noalco <- na.omit(test_data_rf_noalco)
+
+rf_model_noalco <- randomForest(value ~ score + age.x + alcohol_consumption + smoking_status + alcoholVolume + BMI, 
+                         data = train_data_rf_noalco, 
+                         ntree = 300,  
+                         mtry = 2,    
+                         importance = TRUE) 
+
+rf_predictions_no_alco <- predict(rf_model_noalco, newdata = test_data_rf_noalco)
+rf_r_squared_noalco <- cor(test_data_rf_noalco$value, rf_predictions_no_alco)^2
+cat("R² (Random Forest):", round(rf_r_squared_noalco, 3))
+```
+
+
+# MSE и MAE:
+
+```{r}
+mse_rf_noalco <- mean((test_data_rf_noalco$value - rf_predictions_no_alco)^2)
+cat("MSE:", mse_rf_noalco, "\n")    
+
+mae_rf_noalco <- mean(abs(test_data_rf_noalco$value - rf_predictions_no_alco))
+cat("MAE:", mae_rf_noalco, "\n")
+
+mape_rf_noalco <- mean(abs((test_data_rf_noalco$value - rf_predictions_no_alco) / test_data_rf_noalco$value)) * 100
+cat("MAPE:", mape_rf_noalco, "\n")
+```
+
+
+
+#Actual and predicted value
+```{r}
+# Set the plot to be square
+par(pty = "s")
+
+# Create a plot with equal limits on both axes
+plot(test_data_rf_noalco$value, rf_predictions_no_alco,
+     xlim = range(c(test_data_rf_noalco$value, rf_predictions_no_alco)),
+     ylim = range(c(test_data_rf_noalco$value, rf_predictions_no_alco)),
+     xlab = "Actual value", 
+     ylab = "Predicted value", 
+     main = "Actual vs Predicted values",
+     pch = 19, col = "skyblue")  
+
+# Add a diagonal line passing through 0, with slope 1
+abline(a = 0, b = 1, col = "red")  
+
+# Add grid lines
+grid()
+```
+
+#Residual Plot
+
+```{r}
+residuals <- test_data_rf_noalco$value - rf_predictions_no_alco
+
+# Plot settings
+par(mfrow = c(1,1), pty = "m", mar = c(4,4,3,2))
+
+# Create an improved plot
+plot(rf_predictions_no_alco, residuals,
+     xlab = "Predicted Values", 
+     ylab = "Residuals (Actual - Predicted)",
+     main = "Residuals Analysis of Regression Model",
+     pch = 19, col = adjustcolor("steelblue", alpha.f = 0.6),
+     cex = 1.2, las = 1,
+     ylim = c(-max(abs(residuals))*1.1, max(abs(residuals))*1.1))
+
+# Add elements
+abline(h = 0, col = "red3", lwd = 2)  # Horizontal zero line
+grid(col = "lightgray", lty = "dotted")  # Grid for better readability
+
+# Add a smoothing line
+lines(lowess(rf_predictions_no_alco, residuals), col = "darkgreen", lwd = 2)
+
+# Add a legend
+legend("topright", 
+       legend = c("Residuals", "Zero Line", "Residuals Trend"),
+       col = c("steelblue", "red3", "darkgreen"),
+       pch = c(19, NA, NA), lty = c(NA, 1, 1), lwd = 2)
+```
+
+
+#Obtaining the importance of each predictor
+```{r}
+print(importance(rf_model_noalco))
+```
+
+
+# Feature importance plot:
+
+```{r}
+varImpPlot(rf_model_noalco, 
+           main = "Importance of predictors", 
+           type = 1)  # type = 1 for Mean Decrease Accuracy
+```
+
+
+# Plot of LDL dependence on PRS by age and gender:
+```{r}
+# Define age groups (in 5-year intervals)
+age_breaks <- seq(20, 80, by = 5)
+age_labels <- paste(head(age_breaks, -1), tail(age_breaks, -1), sep = "-")
+
+# Add an age group column
+df_clean_noalco <- df_clean_noalco %>%
+  mutate(age_group = cut(
+    age.x,
+    breaks = age_breaks,
+    labels = age_labels,
+    right = FALSE,
+    include.lowest = TRUE
+  )) %>%
+  filter(!is.na(age_group))
+
+# Create a boxplot highlighting the normal zone and differentiating by gender
+ggplot(df_clean_noalco, aes(x = age_group, y = value, fill = gender.x)) +
+  annotate("rect", xmin = -Inf, xmax = Inf, ymin = 1.97, ymax = 4.65,
+           fill = "lightgreen", alpha = 0.3) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  labs(
+    title = "The influence of age on LDL levels by age groups",
+    x = "Age group",
+    y = "LDL",
+    fill = "Gender"
+  ) +
+  scale_fill_manual(values = c("lightpink", "lightblue")) +
+  theme_minimal(base_size = 20) +
+  theme(
+    axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 16),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    plot.title = element_text(size = 20, face = "bold"),
+    legend.text = element_text(size = 24),
+    legend.title = element_text(size = 26)
+  )
+```
+
+
+# Plot of value dependence on score:
+
+```{r}
+ggplot(df_clean_noalco, aes(x = score, y = value)) +  
+  geom_point(shape = 21,                     # Point shape
+             color = "blue",                 # Outline color
+             fill = "skyblue",               # Fill color
+             size = 3) +                     # Point size
+  geom_smooth(method = "lm", color = "red") +   # Linear model fit line
+  labs(title = "LDL Dependence on PRS",        # Plot title
+       x = "PRS",                              # X-axis label
+       y = "LDL") +                            # Y-axis label
+  theme(
+    # Increase axis text size
+    axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 10),
+    
+    # Increase axis labels size
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    
+    # Increase plot title size
+    plot.title = element_text(size = 20, face = "bold")
+  )
+```
+
+
+#Comparison of actual and predicted LDL values
+
+```{r}
+# Add predicted values to the dataset
+test_data_rf_noalco$predicted_value <- rf_predictions_no_alco
+
+# Define age intervals (5-year ranges)
+age_breaks <- c(20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70)
+
+# Generate interval labels like "20-25", "25-30", etc.
+age_labels <- paste(head(age_breaks, -1), tail(age_breaks, -1), sep = "-")
+
+# Assign age groups based on intervals
+test_data_rf_noalco <- test_data_rf_noalco %>%
+  mutate(age_group = cut(
+    age.x,
+    breaks = age_breaks,
+    labels = age_labels,
+    right = FALSE,
+    include.lowest = TRUE
+  ))
+
+library(tidyr)
+
+# Convert data to long format for plotting
+plot_data <- test_data_rf_noalco %>%
+  pivot_longer(
+    cols = c(value, predicted_value),
+    names_to = "value_type",
+    values_to = "LDL_level"
+  )
+
+# Plot comparison with boxplots and facets by gender
+ggplot(plot_data, aes(x = age_group, y = LDL_level, fill = value_type)) +
+  annotate("rect", 
+           xmin = -Inf, xmax = Inf, 
+           ymin = 1.91, ymax = 4.65,
+           fill = "lightgreen", alpha = 0.3) +
+  geom_boxplot(alpha = 0.7, color = "grey30") +
+  labs(
+    title = "Comparison of Actual and Predicted LDL Values",
+    x = "Age Group",
+    y = "LDL Level (mmol/L)"
+  ) +
+  scale_fill_manual(
+    values = c("value" = "#1f78b4", "predicted_value" = "#33a02c"),
+    labels = c("Actual Value", "Predicted Value"),
+    name = "Measurement Type"
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    axis.text.x = element_text(size = 16, angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 16),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    plot.title = element_text(size = 20, face = "bold"),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 18),
+    strip.text = element_text(size = 18, face = "bold")  # For facet labels
+  ) +
+  facet_wrap(~ gender.x, ncol = 2)
+```
+
+# Look at the percentage of people outside the normal range in PRS bins:
+```{r}
+# LDL norm boundaries
+lower_norm <- 1.97
+upper_norm <- 4.65
+
+# 1. Create 10% PRS bins (10 groups)
+df_clean_noalco <- df_clean_noalco %>%
+  mutate(
+    PRS_group = cut(
+      score,
+      breaks = quantile(score, probs = seq(0, 1, 0.1), na.rm = TRUE),
+      labels = paste0(seq(0, 90, 10), "-", seq(10, 100, 10), "%"),
+      include.lowest = TRUE
+    )
+  ) %>%
+  filter(!is.na(PRS_group))
+
+# 2. Calculate LDL deviation percentages
+result <- df_clean_noalco %>%
+  group_by(PRS_group) %>%
+  summarize(
+    percent_below = mean(value < lower_norm, na.rm = TRUE) * 100,
+    percent_above = mean(value > upper_norm, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# 3. Prepare data for plotting
+result_long <- result %>%
+  pivot_longer(
+    cols = c(percent_below, percent_above),
+    names_to = "deviation_type",
+    values_to = "percent"
+  ) %>%
+  mutate(
+    deviation_type = recode(deviation_type,
+                          "percent_below" = "Below normal",
+                          "percent_above" = "Above normal")
+  )
+
+# 4. Create the plot
+ggplot(result_long, aes(x = PRS_group, y = percent, fill = deviation_type)) +
+  geom_bar(stat = "identity", alpha = 0.8, width = 0.7) +
+  labs(
+    title = "Percentage of People with LDL Deviations by PRS Deciles",
+    x = "PRS Groups (Deciles)",
+    y = "Percentage of People (%)",
+    fill = "Deviation Category"
+  ) +
+  scale_fill_manual(
+    values = c("Below normal" = "#FF6B6B", "Above normal" = "#6B8EFF"),
+    labels = c("Below normal", "Above normal")
+  ) +
+  theme_minimal(base_size = 16) +  # базовый размер текста
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 14),
+    legend.position = "top",
+    panel.grid.major.x = element_blank()
+  )
+```
+
+
+#The same, but for better visualization, we will split the plots for values above the normal range and below the normal range.
+
+```{r}
+ggplot(result_long, aes(x = PRS_group, y = percent, fill = deviation_type)) +
+  geom_col(width = 0.7, alpha = 0.85) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", percent)),
+    vjust = -0.5,
+    size = 5,  # Increase text size above columns
+    color = "black"
+  ) +
+  facet_wrap(~deviation_type, scales = "free_y") +
+  scale_fill_manual(values = c("Below normal" = "#6B8EFF", "Above normal" = "#FF6B6B")) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15))  # 15% padding on top
+  ) +
+  labs(
+    title = "LDL Deviations Out of Norm by PRS Deciles",
+    x = "PRS Groups (Deciles)",
+    y = "Percentage of People (%)"
+  ) +
+  theme_minimal(base_size = 16) +  # Global font size increase
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 14),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    strip.text = element_text(size = 16, face = "bold"),  # Facet titles
+    legend.position = "none",
+    panel.grid.major.x = element_blank()
+  )
+```
+
+# Now, split the lower and upper PRS groups into percentiles and then estimate their Odds Ratios (OR) within each group.
+```{r}
+# 1. Create custom PRS bins (0-5, 5-10, 10-20, ..., 90-95, 95-100)
+prs_breaks <- quantile(df_clean_noalco$score, probs = c(0, 0.05, 0.10, seq(0.2, 0.9, 0.1), 0.95, 1.0), na.rm = TRUE)
+prs_labels <- c("0-5%", "5-10%", "10-20%", "20-30%", "30-40%", "40-50%", 
+                "50-60%", "60-70%", "70-80%", "80-90%", "90-95%", "95-100%")
+
+df_clean_noalco <- df_clean_noalco %>%
+  mutate(
+    PRS_group = cut(score, breaks = prs_breaks, labels = prs_labels, include.lowest = TRUE)
+  ) %>%
+  filter(!is.na(PRS_group))
+
+# 2. Calculate LDL deviation percentages
+result <- df_clean_noalco %>%
+  group_by(PRS_group) %>%
+  summarize(
+    percent_below = mean(value < lower_norm, na.rm = TRUE) * 100,
+    percent_above = mean(value > upper_norm, na.rm = TRUE) * 100,
+    .groups = "drop"
+  )
+
+# 3. Prepare data for plotting
+result_long <- result %>%
+  pivot_longer(
+    cols = c(percent_below, percent_above),
+    names_to = "deviation_type",
+    values_to = "percent"
+  ) %>%
+  mutate(
+    deviation_type = recode(deviation_type,
+                            "percent_below" = "Below normal",
+                            "percent_above" = "Above normal")
+  )
+
+# 4. Create the plot
+
+ggplot(result_long, aes(x = PRS_group, y = percent, fill = deviation_type)) +
+  geom_col(alpha = 0.8, width = 0.7) +
+  scale_fill_manual(
+    values = c("Below normal" = "#FF6B6B", "Above normal" = "#6B8EFF")
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title = "Percentage of People with LDL Deviations by PRS Percentiles",
+    x = "PRS Groups (Percentiles)",
+    y = "Percentage of People (%)",
+    fill = "Deviation Category"
+  ) +
+  theme_minimal(base_size = 20) +  # увеличен базовый размер
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 18),
+    axis.title.x = element_text(size = 20),
+    axis.title.y = element_text(size = 20),
+    plot.title = element_text(size = 22, hjust = 0.5, face = "bold"),
+    legend.title = element_text(size = 20),
+    legend.text = element_text(size = 18),
+    legend.position = "top",
+    panel.grid.major.x = element_blank()
+  )
+
+```
+
+# Plot of OR (Odds Ratio) for each percentile group among those below the normal range
+
+```{r}
+# 1. Set the normal range boundary
+lower_norm <- 1.97
+
+# 2. Create the target variable: below normal = 1, normal and above = 0
+df_clean_noalco <- df_clean_noalco %>%
+  mutate(ldl_below = ifelse(value < lower_norm, 1, 0))
+
+# 3. Create PRS deciles
+labels_deciles <- paste0(seq(0, 90, 10), "-", seq(10, 100, 10), "%")
+df_clean_noalco <- df_clean_noalco %>%
+  mutate(PRS_decile = cut(
+    score,
+    breaks = quantile(score, probs = seq(0, 1, 0.1), na.rm = TRUE),
+    labels = labels_deciles,
+    include.lowest = TRUE
+  ))
+
+# 4. Check for the presence of the required reference group
+decile_levels <- levels(df_clean_noalco$PRS_decile)
+ref_group <- if ("0-5%" %in% decile_levels) "0-5%" else "0-10%"
+
+# 5. Set the reference group
+df_clean_noalco$PRS_decile <- relevel(factor(df_clean_noalco$PRS_decile), ref = ref_group)
+
+# 6. Logistic regression model
+model <- glm(ldl_below ~ PRS_decile, data = df_clean_noalco, family = binomial)
+
+# 7. Get OR and confidence intervals
+or_data <- as.data.frame(exp(cbind(OR = coef(model), confint(model))))
+or_data$Decile <- rownames(or_data)
+
+# 8. Keep only the decile coefficients
+or_data <- or_data[grep("PRS_decile", or_data$Decile), ]
+or_data$Decile <- gsub("PRS_decile", "", or_data$Decile)
+
+# 9. Define the order of levels
+or_data$Decile <- factor(or_data$Decile, levels = labels_deciles)
+
+# 10. Add a row for the reference group
+ref_row <- data.frame(
+  OR = 1,
+  `X2.5.` = NA_real_,
+  `X97.5.` = NA_real_,
+  Decile = factor(ref_group, levels = labels_deciles)
+)
+
+# Rename columns
+names(or_data)[names(or_data) == "2.5 %"] <- "X2.5."
+names(or_data)[names(or_data) == "97.5 %"] <- "X97.5."
+
+# 11. Combine the data
+or_data <- rbind(ref_row, or_data)
+
+# 12. Final plot
+library(ggplot2)
+plot <- ggplot(or_data, aes(x = Decile, y = OR)) +
+  geom_point(size = 5, color = "#1f78b4", shape = 16) +
+  geom_errorbar(aes(ymin = X2.5., ymax = X97.5.),
+                width = 0.4, color = "#1f78b4", linewidth = 1.4) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", linewidth = 1) +
+  labs(
+    title = "Odds Ratio of LDL Deficiency by PRS Decile",
+    subtitle = paste("Reference group:", ref_group),
+    x = "PRS deciles",
+    y = "Odds Ratio (Below norm)"
+  ) +
+  theme_minimal(base_size = 17) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 13),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 20),
+    plot.subtitle = element_text(hjust = 0.5, size = 15),
+    axis.title = element_text(size = 15)
+  )
+
+# 13. Save the plot
+ggsave("LDL_OR_plot_ref_lowest.png", plot = plot, width = 16, height = 12, units = "in", dpi = 300)
+```
+
+
+# Plot of OR (Odds Ratio) for each percentile group among those above the normal range
+```{r}
+# 1. Set the upper limit of the normal range
+upper_norm <- 4.65
+
+# 2. Target variable: above normal = 1, normal and below = 0
+df_clean_noalco <- df_clean_noalco %>%
+  mutate(ldl_above = ifelse(value > upper_norm, 1, 0))
+
+# 3. Create PRS deciles
+labels_deciles <- paste0(seq(0, 90, 10), "-", seq(10, 100, 10), "%")
+df_clean_noalco <- df_clean_noalco %>%
+  mutate(PRS_decile = cut(
+    score,
+    breaks = quantile(score, probs = seq(0, 1, 0.1), na.rm = TRUE),
+    labels = labels_deciles,
+    include.lowest = TRUE
+  ))
+
+# 4. Set reference group
+ref_group <- "0-10%"
+df_clean_noalco$PRS_decile <- relevel(factor(df_clean_noalco$PRS_decile), ref = ref_group)
+
+# 5. Logistic regression model
+model_above <- glm(ldl_above ~ PRS_decile, data = df_clean_noalco, family = binomial)
+
+# 6. OR and confidence intervals
+or_above <- as.data.frame(exp(cbind(OR = coef(model_above), confint(model_above))))
+or_above$Decile <- rownames(or_above)
+or_above <- or_above[grep("PRS_decile", or_above$Decile), ]
+or_above$Decile <- gsub("PRS_decile", "", or_above$Decile)
+
+# 7. Set order of levels
+or_above$Decile <- factor(or_above$Decile, levels = labels_deciles)
+
+# 8. Rename columns
+colnames(or_above)[colnames(or_above) == "2.5 %"] <- "CI_low"
+colnames(or_above)[colnames(or_above) == "97.5 %"] <- "CI_high"
+
+# 9. Add a row for the reference group with OR=1 and CI=1
+ref_above <- data.frame(
+  OR = 1,
+  CI_low = 1,
+  CI_high = 1,
+  Decile = factor(ref_group, levels = labels_deciles)
+)
+
+# 10. Combine the reference with the OR data
+or_above <- rbind(ref_above, or_above)
+
+# 11. Plot
+ggplot(or_above, aes(x = Decile, y = OR)) +
+  geom_point(color = "#E31A1C", size = 5, shape = 16) +
+  geom_errorbar(aes(ymin = CI_low, ymax = CI_high),
+                width = 0.4, color = "#E31A1C", linewidth = 1.4) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", linewidth = 1) +
+  labs(
+    title = "Odds Ratio of LDL Excess by PRS Decile",
+    subtitle = paste0("Reference group: ", ref_group),
+    x = "PRS deciles",
+    y = "Odds Ratio (Above norm)"
+  ) +
+  theme_minimal(base_size = 17) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 14),
+    axis.text.y = element_text(size = 13),
+    plot.title = element_text(face = "bold", hjust = 0.5, size = 20),
+    plot.subtitle = element_text(hjust = 0.5, size = 15),
+    axis.title = element_text(size = 15)
+  )
+
+# 12. Save the plot
+ggsave("LDL_OR_plot_ref_0_10_above.png", width = 16, height = 12, units = "in", dpi = 300)
+```
+
